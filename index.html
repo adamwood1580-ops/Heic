@@ -30,7 +30,7 @@
           Drag & drop HEIC files here <span class="pill">or</span> choose files
         </div>
 
-        <input id="picker" type="file" accept=".heic,image/heic,image/heif" multiple />
+        <input id="picker" type="file" accept=".heic,.heif,image/heic,image/heif" multiple />
 
         <div class="row" style="justify-content:center;">
           <label>
@@ -51,7 +51,8 @@
     </div>
 
     <!-- Libraries -->
-    <script src="https://cdn.jsdelivr.net/npm/heic2any/dist/heic2any.min.js"></script>
+    <!-- Updated: use heic-to instead of heic2any -->
+    <script src="https://cdn.jsdelivr.net/npm/heic-to@1.4.2/dist/iife/heic-to.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
     <script>
@@ -110,7 +111,8 @@
 
       // Some browsers need a canvas round-trip to ensure we truly have JPEG
       async function forceJpeg(blob, quality) {
-        if (blob.type === "image/jpeg") return blob;
+        if (blob && blob.type === "image/jpeg") return blob;
+
         const img = new Image();
         const url = URL.createObjectURL(blob);
         try {
@@ -141,6 +143,31 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
 
+      // Helper: convert one HEIC/HEIF file -> JPEG Blob using heic-to
+      async function heicFileToJpegBlob(file, quality) {
+        if (!window.HeicTo) {
+          throw new Error("Converter library (HeicTo) not loaded");
+        }
+
+        // heic-to provides a quick detector; if it can't detect, we'll still attempt conversion
+        try {
+          const isHeic = await HeicTo.isHeic(file);
+          if (!isHeic) throw new Error("Not detected as HEIC/HEIF");
+        } catch (_) {
+          // ignore detection errors and try conversion anyway
+        }
+
+        // Convert to JPEG
+        const outBlob = await HeicTo({
+          blob: file,
+          type: "image/jpeg",
+          quality: quality
+        });
+
+        // Ensure we end up with a proper JPEG blob everywhere
+        return await forceJpeg(outBlob, quality);
+      }
+
       convertBtn.addEventListener("click", async () => {
         if (!heicFiles.length) return;
 
@@ -156,17 +183,15 @@
           prog.value = i + 1;
 
           try {
-            // Convert HEIC -> JPEG (blob)
-            const out = await heic2any({ blob: f, toType: "image/jpeg", quality: q });
-            const blob = Array.isArray(out) ? out[0] : out;
-            const jpegBlob = await forceJpeg(blob, q);
+            const jpegBlob = await heicFileToJpegBlob(f, q);
 
             const base = (f.name || `image_${i+1}`).replace(/\.(heic|heif)$/i, "");
             zip.file(`${base}.jpg`, jpegBlob);
 
             lines.push(`✓ ${f.name} → ${base}.jpg`);
           } catch (err) {
-            lines.push(`✗ ${f.name} (failed: ${err?.message || err})`);
+            const msg = (err && err.message) ? err.message : String(err);
+            lines.push(`✗ ${f.name} (failed: ${msg})`);
           }
 
           showList(lines);
