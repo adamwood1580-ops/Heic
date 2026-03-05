@@ -18,11 +18,17 @@
       #list { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
       .muted { opacity: .75; font-size: 14px; }
       .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(128,128,128,.45); font-size: 12px; }
+      details { text-align:left; margin-top: 12px; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     </style>
   </head>
   <body>
     <h1>HEIC → JPG (Batch)</h1>
-    <div class="muted">Runs locally in your browser. No uploads. Exports a ZIP of JPGs.</div>
+    <div class="muted">
+      Runs locally in your browser. No uploads. Exports a ZIP of JPGs.
+      <br />
+      If you see <code>ERR_LIBHEIF format not supported</code>, that usually means the HEIC uses a codec your browser-side decoder can’t handle (common with HEVC-based HEIC).  [oai_citation:0‡GitHub](https://github.com/alexcorvi/heic2any/issues/50?utm_source=chatgpt.com)
+    </div>
 
     <div class="card" style="margin-top:16px;">
       <div class="drop" id="drop">
@@ -45,13 +51,26 @@
           <progress id="prog" value="0" max="1"></progress>
           <span id="status" class="muted"></span>
         </div>
+
+        <details class="muted">
+          <summary>Troubleshooting “format not supported”</summary>
+          <div style="margin-top:8px;">
+            Some HEIC files can’t be decoded in-browser due to codec support limits (often HEVC).
+            If a file fails:
+            <ul>
+              <li>Try a different browser/device (Safari on iPhone sometimes works via native decoding).</li>
+              <li>If you need 100% reliability for all HEIC variants, you’ll need a server-side converter (e.g., ffmpeg/libheif built with HEVC support).</li>
+              <li>For future iPhone photos: Camera settings → Formats → “Most Compatible” (captures JPEG/HEVC video changes).</li>
+            </ul>
+          </div>
+        </details>
       </div>
 
       <div id="list"></div>
     </div>
 
     <!-- Libraries -->
-    <!-- Updated: use heic-to instead of heic2any -->
+    <!-- We keep heic-to as a fallback decoder. -->
     <script src="https://cdn.jsdelivr.net/npm/heic-to@1.4.2/dist/iife/heic-to.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
@@ -109,29 +128,6 @@
       );
       drop.addEventListener("drop", e => setFiles(e.dataTransfer.files));
 
-      // Some browsers need a canvas round-trip to ensure we truly have JPEG
-      async function forceJpeg(blob, quality) {
-        if (blob && blob.type === "image/jpeg") return blob;
-
-        const img = new Image();
-        const url = URL.createObjectURL(blob);
-        try {
-          await new Promise((res, rej) => {
-            img.onload = () => res();
-            img.onerror = rej;
-            img.src = url;
-          });
-          const canvas = document.createElement("canvas");
-          canvas.width = img.naturalWidth;
-          canvas.height = img.naturalHeight;
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0);
-          return await new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
-        } finally {
-          URL.revokeObjectURL(url);
-        }
-      }
-
       function downloadBlob(blob, filename) {
         const a = document.createElement("a");
         const url = URL.createObjectURL(blob);
@@ -143,29 +139,78 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
 
-      // Helper: convert one HEIC/HEIF file -> JPEG Blob using heic-to
-      async function heicFileToJpegBlob(file, quality) {
-        if (!window.HeicTo) {
-          throw new Error("Converter library (HeicTo) not loaded");
+      async function canvasToJpegBlob(canvas, quality) {
+        return await new Promise((res, rej) => {
+          canvas.toBlob(b => (b ? res(b) : rej(new Error("Failed to create JPEG blob"))), "image/jpeg", quality);
+        });
+      }
+
+      // Attempt 1: native browser decode (works on some Safari/iOS setups).
+      // If this succeeds, we avoid libheif entirely.
+      async function tryNativeDecodeToJpeg(file, quality) {
+        // Prefer createImageBitmap when available (faster, no DOM image element needed).
+        if (window.createImageBitmap) {
+          const bmp = await createImageBitmap(file); // will throw if unsupported
+          try {
+            const canvas = document.createElement("canvas");
+            canvas.width = bmp.width;
+            canvas.height = bmp.height;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(bmp, 0, 0);
+            return await canvasToJpegBlob(canvas, quality);
+          } finally {
+            // Avoid leaks
+            if (bmp && bmp.close) bmp.close();
+          }
         }
 
-        // heic-to provides a quick detector; if it can't detect, we'll still attempt conversion
+        // Fallback: <img> decode
+        const img = new Image();
+        const url = URL.createObjectURL(file);
         try {
-          const isHeic = await HeicTo.isHeic(file);
-          if (!isHeic) throw new Error("Not detected as HEIC/HEIF");
-        } catch (_) {
-          // ignore detection errors and try conversion anyway
+          await new Promise((res, rej) => {
+            img.onload = () => res();
+            img.onerror = rej;
+            img.src = url;
+          });
+          const canvas = document.createElement("canvas");
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          return await canvasToJpegBlob(canvas, quality);
+        } finally {
+          URL.revokeObjectURL(url);
         }
+      }
 
-        // Convert to JPEG
+      // Attempt 2: heic-to (WASM/libheif) fallback decoder.
+      async function tryHeicToDecodeToJpeg(file, quality) {
+        if (!window.HeicTo) throw new Error("Converter library (HeicTo) not loaded");
         const outBlob = await HeicTo({
           blob: file,
           type: "image/jpeg",
           quality: quality
         });
+        // Ensure it's a Blob and of the right type
+        if (!(outBlob instanceof Blob)) throw new Error("HeicTo returned unexpected output");
+        if (outBlob.type === "image/jpeg") return outBlob;
 
-        // Ensure we end up with a proper JPEG blob everywhere
-        return await forceJpeg(outBlob, quality);
+        // Last resort: round-trip through canvas
+        return await tryNativeDecodeToJpeg(outBlob, quality);
+      }
+
+      // Combined strategy:
+      // 1) Native decode first (best when it works)
+      // 2) Fallback to HeicTo (WASM)
+      async function heicFileToJpegBlob(file, quality) {
+        // Native first
+        try {
+          return await tryNativeDecodeToJpeg(file, quality);
+        } catch (_) {
+          // ignore and try wasm decoder
+        }
+        return await tryHeicToDecodeToJpeg(file, quality);
       }
 
       convertBtn.addEventListener("click", async () => {
@@ -184,10 +229,8 @@
 
           try {
             const jpegBlob = await heicFileToJpegBlob(f, q);
-
             const base = (f.name || `image_${i+1}`).replace(/\.(heic|heif)$/i, "");
             zip.file(`${base}.jpg`, jpegBlob);
-
             lines.push(`✓ ${f.name} → ${base}.jpg`);
           } catch (err) {
             const msg = (err && err.message) ? err.message : String(err);
